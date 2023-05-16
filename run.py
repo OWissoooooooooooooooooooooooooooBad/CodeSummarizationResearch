@@ -33,13 +33,15 @@ import numpy as np
 from io import open
 from itertools import cycle
 import torch.nn as nn
-from model import Seq2Seq
+from utils import get_model_size
 from tqdm import tqdm, trange
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler,TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 
 from transformers import (WEIGHTS_NAME, AdamW, get_linear_schedule_with_warmup,
-              RobertaConfig, RobertaModel, RobertaTokenizer)
+                          T5Config, T5ForConditionalGeneration, RobertaTokenizer)
+
+
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt = '%m/%d/%Y %H:%M:%S',
                     level = logging.INFO)
@@ -221,16 +223,11 @@ def main():
 
     # build model
     tokenizer = RobertaTokenizer.from_pretrained(args.model_name_or_path)
-    config = RobertaConfig.from_pretrained(args.model_name_or_path)
-    # import！！！you must set is_decoder as True for generation
-    config.is_decoder = True
-    encoder = RobertaModel.from_pretrained(args.model_name_or_path,config=config) 
-
-    model = Seq2Seq(encoder=encoder,decoder=encoder,config=config,
-                  beam_size=args.beam_size,max_length=args.max_target_length,
-                  sos_id=tokenizer.convert_tokens_to_ids(["<mask0>"])[0],eos_id=tokenizer.sep_token_id)
+    config = T5Config.from_pretrained(args.model_name_or_path)
     
-    logger.info("Training/evaluation parameters %s", args)
+    model = T5ForConditionalGeneration.from_pretrained(args.model_name_or_path)
+    logger.info("Finish loading model [%s] from %s", get_model_size(model), args.model_name_or_path)
+    
     model.to(args.device)   
     
     if args.n_gpu > 1:
@@ -256,14 +253,17 @@ def main():
             {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
         ]
         optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
-        scheduler = get_linear_schedule_with_warmup(optimizer, 
-                                                    num_warmup_steps=int(len(train_dataloader)*args.num_train_epochs*0.1),
-                                                    num_training_steps=len(train_dataloader)*args.num_train_epochs)
+        num_train_optimization_steps = args.num_train_epochs * len(train_dataloader)
+        scheduler = get_linear_schedule_with_warmup(optimizer,
+                                                    num_warmup_steps=args.warmup_steps,
+                                                    num_training_steps=num_train_optimization_steps)
     
         #Start training
+        train_example_num = len(train_data)
         logger.info("***** Running training *****")
-        logger.info("  Num examples = %d", len(train_examples))
-        logger.info("  Batch size = %d", args.train_batch_size * args.gradient_accumulation_steps)
+        logger.info("  Num examples = %d", train_example_num)
+        logger.info("  Batch size = %d", args.train_batch_size)
+        logger.info("  Batch num = %d", math.ceil(train_example_num / args.train_batch_size))
         logger.info("  Num epoch = %d", args.num_train_epochs)
         
 
