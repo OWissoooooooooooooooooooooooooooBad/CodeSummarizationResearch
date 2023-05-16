@@ -28,6 +28,7 @@ import torch
 import json
 import random
 import logging
+import math
 import argparse
 import numpy as np
 from io import open
@@ -53,14 +54,10 @@ class Example(object):
                  idx,
                  source,
                  target,
-                 similar_code,
-                 similar_comment,
                  ):
         self.idx = idx
         self.source = source
         self.target = target
-        self.similar_code = similar_code
-        self.similar_comment = similar_comment
 
 def read_examples(filename):
     """Read examples from filename."""
@@ -71,16 +68,15 @@ def read_examples(filename):
             js = json.loads(line)
             if 'idx' not in js:
                 js['idx']=idx
-            if 'similar_code_0' not in js:
-                js['similar_code_0'] = None
-                js['similar_comment_0'] = None
+            code = ' '.join(js['code_tokens']).replace('\n',' ')
+            code = ' '.join(code.strip().split())
+            nl = ' '.join(js['docstring_tokens']).replace('\n','')
+            nl = ' '.join(nl.strip().split())            
             examples.append(
                 Example(
                         idx = idx,
-                        source = js['source_code'],
-                        target = js['source_comment'],
-                        similar_code=js['similar_code_0'],
-                        similar_comment=js['similar_comment_0']
+                        source = code,
+                        target = nl,
                         ) 
             )
     return examples
@@ -102,11 +98,8 @@ def convert_examples_to_features(examples, tokenizer, args,stage=None):
     features = []
     for example_index, example in enumerate(examples):
         #source
-        if example.similar_comment is None:
-            source_tokens = tokenizer.tokenize(example.source)
-        else:
-            source_tokens = tokenizer.tokenize(example.source)+[tokenizer.sep_token]+tokenizer.tokenize(example.similar_comment)+[tokenizer.sep_token]+tokenizer.tokenize(example.similar_code)
-        source_tokens = [tokenizer.cls_token,"<encoder-decoder>",tokenizer.sep_token,"<mask0>"]+source_tokens[:args.max_source_length-5]+[tokenizer.sep_token]
+        source_tokens = tokenizer.tokenize(example.source)[:args.max_source_length-5]
+        source_tokens = [tokenizer.cls_token,"<encoder-decoder>",tokenizer.sep_token,"<mask0>"]+source_tokens+[tokenizer.sep_token]
         source_ids = tokenizer.convert_tokens_to_ids(source_tokens) 
         padding_length = args.max_source_length - len(source_ids)
         source_ids += [tokenizer.pad_token_id]*padding_length
@@ -140,6 +133,7 @@ def convert_examples_to_features(examples, tokenizer, args,stage=None):
             )
         )
     return features
+
 
 
 
@@ -202,6 +196,8 @@ def main():
                         help="Total number of training epochs to perform.") 
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
+    parser.add_argument("--warmup_steps", default=100, type=int,
+                        help="Linear warmup over warmup_steps.")
     
     # print arguments
     args = parser.parse_args()
@@ -273,7 +269,11 @@ def main():
             for idx,batch in enumerate(train_dataloader):
                 batch = tuple(t.to(device) for t in batch)
                 source_ids,target_ids = batch
-                loss,_,_ = model(source_ids=source_ids,target_ids=target_ids)
+                source_mask = source_ids.ne(tokenizer.pad_token_id)
+                target_mask = target_ids.ne(tokenizer.pad_token_id)
+                outputs = model(input_ids=source_ids, attention_mask=source_mask,
+                                labels=target_ids, decoder_attention_mask=target_mask)
+                loss = outputs.loss
 
                 if args.n_gpu > 1:
                     loss = loss.mean() # mean() to average on multi-gpu.
@@ -311,18 +311,25 @@ def main():
 
                 #Start Evaling model
                 model.eval()
-                eval_loss,tokens_num = 0,0
+                eval_loss, batch_num = 0,0
                 for batch in eval_dataloader:
                     batch = tuple(t.to(device) for t in batch)
                     source_ids,target_ids = batch                  
+                    source_mask = source_ids.ne(tokenizer.pad_token_id)
+                    target_mask = target_ids.ne(tokenizer.pad_token_id)
 
                     with torch.no_grad():
-                        _,loss,num = model(source_ids=source_ids,target_ids=target_ids)     
-                    eval_loss += loss.sum().item()
-                    tokens_num += num.sum().item()
+                        outputs = model(input_ids=source_ids, attention_mask=source_mask,
+                                        labels=target_ids, decoder_attention_mask=target_mask)
+                        loss = outputs.loss
+                        if args.n_gpu > 1:
+                            loss = loss.mean()
+                            
+                    eval_loss += loss.item()
+                    batch_num += 1
                 #Pring loss of dev dataset    
                 model.train()
-                eval_loss = eval_loss / tokens_num
+                eval_loss = eval_loss / batch_num
                 result = {'eval_ppl': round(np.exp(eval_loss),5)}
                 for key in sorted(result.keys()):
                     logger.info("  %s = %s", key, str(result[key]))
@@ -343,24 +350,35 @@ def main():
                 eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
                 model.eval() 
-                p=[]
+                pred_ids = []
                 for batch in eval_dataloader:
                     batch = tuple(t.to(device) for t in batch)
                     source_ids = batch[0]                  
+                    source_mask = source_ids.ne(tokenizer.pad_token_id)
                     with torch.no_grad():
-                        preds = model(source_ids) 
-                        # convert ids to text
-                        for pred in preds:
-                            t = pred[0].cpu().numpy()
-                            t = list(t)
-                            if 0 in t:
-                                t = t[:t.index(0)]
-                            text = tokenizer.decode(t,clean_up_tokenization_spaces=False)
-                            p.append(text)
+                        if args.n_gpu > 1:
+                            preds = model.module.generate(source_ids,
+                                       attention_mask=source_mask,
+                                       use_cache=True,
+                                       num_beams=args.beam_size,
+                                       early_stopping=True,
+                                       max_length=args.max_target_length)
+                        else:
+                            preds = model.generate(source_ids,
+                                       attention_mask=source_mask,
+                                       use_cache=True,
+                                       num_beams=args.beam_size,
+                                       early_stopping=True,
+                                       max_length=args.max_target_length)
+                        top_preds = list(preds.cpu().numpy())
+                    pred_ids.extend(top_preds)
+                
+                pred_nls = [tokenizer.decode(id, skip_special_tokens=True, clean_up_tokenization_spaces=False) for id in pred_ids]
+                
                 model.train()
                 predictions = []
                 with open(args.output_dir+"/dev.output",'w') as f, open(args.output_dir+"/dev.gold",'w') as f1:
-                    for ref,gold in zip(p,eval_examples):
+                    for ref,gold in zip(pred_nls,eval_examples):
                         predictions.append(str(gold.idx)+'\t'+ref)
                         f.write(str(gold.idx)+'\t'+ref+'\n')
                         f1.write(str(gold.idx)+'\t'+gold.target+'\n')     
@@ -401,25 +419,35 @@ def main():
         eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
         model.eval() 
-        p=[]
-        for batch in tqdm(eval_dataloader,total=len(eval_dataloader)):
+        pred_ids = []
+        for batch in tqdm(eval_dataloader):
             batch = tuple(t.to(device) for t in batch)
             source_ids = batch[0]                  
+            source_mask = source_ids.ne(tokenizer.pad_token_id)
             with torch.no_grad():
-                preds = model(source_ids)   
-                # convert ids to text
-                for pred in preds:
-                    t = pred[0].cpu().numpy()
-                    t = list(t)
-                    if 0 in t:
-                        t = t[:t.index(0)]
-                    text = tokenizer.decode(t,clean_up_tokenization_spaces=False)
-                    p.append(text)
+                if args.n_gpu > 1:
+                    preds = model.module.generate(source_ids,
+                                attention_mask=source_mask,
+                                use_cache=True,
+                                num_beams=args.beam_size,
+                                early_stopping=True,
+                                max_length=args.max_target_length)
+                else:
+                    preds = model.generate(source_ids,
+                                attention_mask=source_mask,
+                                use_cache=True,
+                                num_beams=args.beam_size,
+                                early_stopping=True,
+                                max_length=args.max_target_length)
+                top_preds = list(preds.cpu().numpy())
+            pred_ids.extend(top_preds)
+        
+        pred_nls = [tokenizer.decode(id, skip_special_tokens=True, clean_up_tokenization_spaces=False) for id in pred_ids]
                     
         model.train()
         predictions=[]
         with open(args.output_dir+"/test.output",'w') as f, open(args.output_dir+"/test.gold",'w') as f1:
-            for ref,gold in zip(p,eval_examples):
+            for ref,gold in zip(pred_nls,eval_examples):
                 predictions.append(str(gold.idx)+'\t'+ref)
                 f.write(str(gold.idx)+'\t'+ref+'\n')
                 f1.write(str(gold.idx)+'\t'+gold.target+'\n')     
