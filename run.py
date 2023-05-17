@@ -54,10 +54,14 @@ class Example(object):
                  idx,
                  source,
                  target,
+                 similar_code,
+                 similar_comment,
                  ):
         self.idx = idx
         self.source = source
         self.target = target
+        self.similar_code = similar_code
+        self.similar_comment = similar_comment
 
 def read_examples(filename):
     """Read examples from filename."""
@@ -68,15 +72,16 @@ def read_examples(filename):
             js = json.loads(line)
             if 'idx' not in js:
                 js['idx']=idx
-            code = ' '.join(js['code_tokens']).replace('\n',' ')
-            code = ' '.join(code.strip().split())
-            nl = ' '.join(js['docstring_tokens']).replace('\n','')
-            nl = ' '.join(nl.strip().split())            
+            if 'similar_code_0' not in js:
+                js['similar_code_0'] = None
+                js['similar_comment_0'] = None
             examples.append(
                 Example(
                         idx = idx,
-                        source = code,
-                        target = nl,
+                        source = js['source_code'],
+                        target = js['source_comment'],
+                        similar_code=js['similar_code_0'],
+                        similar_comment=js['similar_comment_0']
                         ) 
             )
     return examples
@@ -98,8 +103,11 @@ def convert_examples_to_features(examples, tokenizer, args,stage=None):
     features = []
     for example_index, example in enumerate(examples):
         #source
-        source_tokens = tokenizer.tokenize(example.source)[:args.max_source_length-5]
-        source_tokens = [tokenizer.cls_token,"<encoder-decoder>",tokenizer.sep_token,"<mask0>"]+source_tokens+[tokenizer.sep_token]
+        if example.similar_comment is None:
+            source_tokens = tokenizer.tokenize(example.source)
+        else:
+            source_tokens = tokenizer.tokenize(example.source)+[tokenizer.sep_token]+tokenizer.tokenize(example.similar_comment)+[tokenizer.sep_token]+tokenizer.tokenize(example.similar_code)
+        source_tokens = [tokenizer.cls_token,"<encoder-decoder>",tokenizer.sep_token,"<mask0>"]+source_tokens[:args.max_source_length-5]+[tokenizer.sep_token]
         source_ids = tokenizer.convert_tokens_to_ids(source_tokens) 
         padding_length = args.max_source_length - len(source_ids)
         source_ids += [tokenizer.pad_token_id]*padding_length
