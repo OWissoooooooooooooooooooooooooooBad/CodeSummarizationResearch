@@ -34,9 +34,9 @@ import numpy as np
 from io import open
 from itertools import cycle
 import torch.nn as nn
-from utils import get_model_size
+from utils import get_model_size, FiDT5, Collator, Dataset
 from tqdm import tqdm, trange
-from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler,TensorDataset
+from torch.utils.data import DataLoader, SequentialSampler, RandomSampler,TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 
 from transformers import (WEIGHTS_NAME, AdamW, get_linear_schedule_with_warmup,
@@ -47,103 +47,7 @@ logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(messa
                     datefmt = '%m/%d/%Y %H:%M:%S',
                     level = logging.INFO)
 logger = logging.getLogger(__name__)
-#os.environ["CUDA_VISIBLE_DEVICES"]="1"
-class Example(object):
-    """A single training/test example."""
-    def __init__(self,
-                 idx,
-                 source,
-                 target,
-                 similar_code,
-                 similar_comment,
-                 ):
-        self.idx = idx
-        self.source = source
-        self.target = target
-        self.similar_code = similar_code
-        self.similar_comment = similar_comment
-
-def read_examples(filename):
-    """Read examples from filename."""
-    examples = []
-    with open(filename,encoding="utf-8") as f:
-        for idx, line in enumerate(f):
-            line = line.strip()
-            js = json.loads(line)
-            if 'idx' not in js:
-                js['idx']=idx
-            if 'similar_code_0' not in js:
-                js['similar_code_0'] = None
-                js['similar_comment_0'] = None
-            examples.append(
-                Example(
-                        idx = idx,
-                        source = js['source_code'],
-                        target = js['source_comment'],
-                        similar_code=js['similar_code_0'],
-                        similar_comment=js['similar_comment_0']
-                        ) 
-            )
-    return examples
-
-
-class InputFeatures(object):
-    """A single training/test features for a example."""
-    def __init__(self,
-                 example_id,
-                 source_ids,
-                 target_ids,
-    ):
-        self.example_id = example_id
-        self.source_ids = source_ids
-        self.target_ids = target_ids     
-        
-def convert_examples_to_features(examples, tokenizer, args,stage=None):
-    """convert examples to token ids"""
-    features = []
-    for example_index, example in enumerate(examples):
-        #source
-        if example.similar_comment is None:
-            source_tokens = tokenizer.tokenize(example.source)
-        else:
-            source_tokens = tokenizer.tokenize(example.source)+[tokenizer.sep_token]+tokenizer.tokenize(example.similar_comment)+[tokenizer.sep_token]+tokenizer.tokenize(example.similar_code)
-        source_tokens = [tokenizer.cls_token,"<encoder-decoder>",tokenizer.sep_token,"<mask0>"]+source_tokens[:args.max_source_length-5]+[tokenizer.sep_token]
-        source_ids = tokenizer.convert_tokens_to_ids(source_tokens) 
-        padding_length = args.max_source_length - len(source_ids)
-        source_ids += [tokenizer.pad_token_id]*padding_length
- 
-        #target
-        if stage=="test":
-            target_tokens = tokenizer.tokenize("None")
-        else:
-            target_tokens = tokenizer.tokenize(example.target)[:args.max_target_length-2]
-        target_tokens = ["<mask0>"] + target_tokens + [tokenizer.sep_token]            
-        target_ids = tokenizer.convert_tokens_to_ids(target_tokens)
-        padding_length = args.max_target_length - len(target_ids)
-        target_ids += [tokenizer.pad_token_id] * padding_length
-   
-        if example_index < 5:
-            if stage=='train':
-                logger.info("*** Example ***")
-                logger.info("idx: {}".format(example.idx))
-
-                logger.info("source_tokens: {}".format([x.replace('\u0120','_') for x in source_tokens]))
-                logger.info("source_ids: {}".format(' '.join(map(str, source_ids))))
-                
-                logger.info("target_tokens: {}".format([x.replace('\u0120','_') for x in target_tokens]))
-                logger.info("target_ids: {}".format(' '.join(map(str, target_ids))))
-       
-        features.append(
-            InputFeatures(
-                 example_index,
-                 source_ids,
-                 target_ids,
-            )
-        )
-    return features
-
-
-
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -227,12 +131,15 @@ def main():
 
     # build model
     tokenizer = RobertaTokenizer.from_pretrained(args.model_name_or_path)
-    config = T5Config.from_pretrained(args.model_name_or_path)
     
-    model = T5ForConditionalGeneration.from_pretrained(args.model_name_or_path)
+    t5 = T5ForConditionalGeneration.from_pretrained(args.model_name_or_path)
+    model = FiDT5(t5.config)
+    model.load_t5(t5.state_dict())
     logger.info("Finish loading model [%s] from %s", get_model_size(model), args.model_name_or_path)
     
     model.to(args.device)   
+    
+    collator = Collator(tokenizer, text_maxlength=args.max_source_length, answer_maxlength=args.max_target_length)
     
     if args.n_gpu > 1:
         # multi-gpu training
@@ -240,14 +147,9 @@ def main():
 
     if args.do_train:
         # Prepare training data loader
-        train_examples = read_examples(args.train_filename)
-        train_features = convert_examples_to_features(train_examples, tokenizer,args,stage='train')
-        all_source_ids = torch.tensor([f.source_ids for f in train_features], dtype=torch.long)
-        all_target_ids = torch.tensor([f.target_ids for f in train_features], dtype=torch.long) 
-        train_data = TensorDataset(all_source_ids,all_target_ids)
+        train_data = Dataset(args.train_filename)
         train_sampler = RandomSampler(train_data)
-        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size // args.gradient_accumulation_steps)
-
+        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size // args.gradient_accumulation_steps, collate_fn=collator)
 
         # Prepare optimizer and schedule (linear warmup and decay)
         no_decay = ['bias', 'LayerNorm.weight']
@@ -275,13 +177,12 @@ def main():
         patience, best_bleu, losses, dev_dataset = 0, 0, [], {}
         for epoch in range(args.num_train_epochs):
             for idx,batch in enumerate(train_dataloader):
-                batch = tuple(t.to(device) for t in batch)
-                source_ids,target_ids = batch
-                source_mask = source_ids.ne(tokenizer.pad_token_id)
-                target_mask = target_ids.ne(tokenizer.pad_token_id)
-                outputs = model(input_ids=source_ids, attention_mask=source_mask,
-                                labels=target_ids, decoder_attention_mask=target_mask)
-                loss = outputs.loss
+                (idx, labels, _, context_ids, context_mask) = batch
+                loss = model(
+                    input_ids=context_ids.cuda(),
+                    attention_mask=context_mask.cuda(),
+                    labels=labels.cuda()
+                )[0]
 
                 if args.n_gpu > 1:
                     loss = loss.mean() # mean() to average on multi-gpu.
@@ -300,84 +201,33 @@ def main():
                                                      len(losses)//args.gradient_accumulation_steps,
                                                      round(np.mean(losses[-100*args.gradient_accumulation_steps:]),4)))
             if args.do_eval:
-                #Eval model with dev dataset                   
-                if 'dev_loss' in dev_dataset:
-                    eval_examples,eval_data = dev_dataset['dev_loss']
-                else:
-                    eval_examples = read_examples(args.dev_filename)
-                    eval_features = convert_examples_to_features(eval_examples, tokenizer, args,stage='dev')
-                    all_source_ids = torch.tensor([f.source_ids for f in eval_features], dtype=torch.long)
-                    all_target_ids = torch.tensor([f.target_ids for f in eval_features], dtype=torch.long)   
-                    eval_data = TensorDataset(all_source_ids,all_target_ids)   
-                    dev_dataset['dev_loss' ]= eval_examples,eval_data
-                eval_sampler = SequentialSampler(eval_data)
-                eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
-
-                logger.info("\n***** Running evaluation *****")
-                logger.info("  Num examples = %d", len(eval_examples))
-                logger.info("  Batch size = %d", args.eval_batch_size)
-
-                #Start Evaling model
-                model.eval()
-                eval_loss, batch_num = 0,0
-                for batch in eval_dataloader:
-                    batch = tuple(t.to(device) for t in batch)
-                    source_ids,target_ids = batch                  
-                    source_mask = source_ids.ne(tokenizer.pad_token_id)
-                    target_mask = target_ids.ne(tokenizer.pad_token_id)
-
-                    with torch.no_grad():
-                        outputs = model(input_ids=source_ids, attention_mask=source_mask,
-                                        labels=target_ids, decoder_attention_mask=target_mask)
-                        loss = outputs.loss
-                        if args.n_gpu > 1:
-                            loss = loss.mean()
-                            
-                    eval_loss += loss.item()
-                    batch_num += 1
-                #Pring loss of dev dataset    
-                model.train()
-                eval_loss = eval_loss / batch_num
-                result = {'eval_ppl': round(np.exp(eval_loss),5)}
-                for key in sorted(result.keys()):
-                    logger.info("  %s = %s", key, str(result[key]))
-                logger.info("  "+"*"*20)   
-
                 #Calculate bleu  
                 if 'dev_bleu' in dev_dataset:
-                    eval_examples,eval_data=dev_dataset['dev_bleu']
+                    eval_data=dev_dataset['dev_bleu']
                 else:
-                    eval_examples = read_examples(args.dev_filename)
-                    eval_examples = random.sample(eval_examples,min(1000,len(eval_examples)))
-                    eval_features = convert_examples_to_features(eval_examples, tokenizer, args,stage='test')
-                    all_source_ids = torch.tensor([f.source_ids for f in eval_features], dtype=torch.long) 
-                    eval_data = TensorDataset(all_source_ids)   
-                    dev_dataset['dev_bleu'] = eval_examples,eval_data
+                    eval_data = Dataset(args.dev_filename)
+                    dev_dataset['dev_bleu'] = eval_data
 
                 eval_sampler = SequentialSampler(eval_data)
-                eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
+                eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size, collate_fn=collator)
 
                 model.eval() 
                 pred_ids = []
                 for batch in eval_dataloader:
-                    batch = tuple(t.to(device) for t in batch)
-                    source_ids = batch[0]                  
-                    source_mask = source_ids.ne(tokenizer.pad_token_id)
+                    (idx, _, _, context_ids, context_mask) = batch
                     with torch.no_grad():
                         if args.n_gpu > 1:
-                            preds = model.module.generate(source_ids,
-                                       attention_mask=source_mask,
-                                       use_cache=True,
-                                       num_beams=args.beam_size,
-                                       early_stopping=True,
-                                       max_length=args.max_target_length)
+                            preds = model.module.generate(
+                                input_ids=context_ids.cuda(),
+                                attention_mask=context_mask.cuda(),
+                                max_length=args.max_target_length
+                            )
                         else:
-                            preds = model.generate(source_ids,
-                                       attention_mask=source_mask,
-                                       use_cache=True,
-                                       num_beams=args.beam_size,
-                                       early_stopping=True,
-                                       max_length=args.max_target_length)
+                            preds = model.generate(
+                                input_ids=context_ids.cuda(),
+                                attention_mask=context_mask.cuda(),
+                                max_length=args.max_target_length
+                            )
                         top_preds = list(preds.cpu().numpy())
                     pred_ids.extend(top_preds)
                 
@@ -386,10 +236,10 @@ def main():
                 model.train()
                 predictions = []
                 with open(args.output_dir+"/dev.output",'w') as f, open(args.output_dir+"/dev.gold",'w') as f1:
-                    for ref,gold in zip(pred_nls,eval_examples):
-                        predictions.append(str(gold.idx)+'\t'+ref)
-                        f.write(str(gold.idx)+'\t'+ref+'\n')
-                        f1.write(str(gold.idx)+'\t'+gold.target+'\n')     
+                    for ref,gold in zip(pred_nls,eval_data.data):
+                        predictions.append(str(gold["idx"])+'\t'+ref)
+                        f.write(str(gold["idx"])+'\t'+ref+'\n')
+                        f1.write(str(gold["idx"])+'\t'+gold["target"]+'\n')     
 
                 (goldMap, predictionMap) = bleu.computeMaps(predictions, os.path.join(args.output_dir, "dev.gold")) 
                 dev_bleu=round(bleu.bleuFromMaps(goldMap, predictionMap)[0],2)
@@ -417,36 +267,29 @@ def main():
         model_to_load = model.module if hasattr(model, 'module') else model  
         model_to_load.load_state_dict(torch.load(output_dir))                
 
-        eval_examples = read_examples(args.test_filename)
-        eval_features = convert_examples_to_features(eval_examples, tokenizer, args,stage='test')
-        all_source_ids = torch.tensor([f.source_ids for f in eval_features], dtype=torch.long)
-        eval_data = TensorDataset(all_source_ids)   
+        eval_data = Dataset(args.test_filename)  
 
         # Calculate bleu
         eval_sampler = SequentialSampler(eval_data)
-        eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
+        eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size, collate_fn=collator)
 
         model.eval() 
         pred_ids = []
         for batch in tqdm(eval_dataloader):
-            batch = tuple(t.to(device) for t in batch)
-            source_ids = batch[0]                  
-            source_mask = source_ids.ne(tokenizer.pad_token_id)
+            (idx, _, _, context_ids, context_mask) = batch
             with torch.no_grad():
                 if args.n_gpu > 1:
-                    preds = model.module.generate(source_ids,
-                                attention_mask=source_mask,
-                                use_cache=True,
-                                num_beams=args.beam_size,
-                                early_stopping=True,
-                                max_length=args.max_target_length)
+                    preds = model.module.generate(
+                        input_ids=context_ids.cuda(),
+                        attention_mask=context_mask.cuda(),
+                        max_length=args.max_target_length
+                    )
                 else:
-                    preds = model.generate(source_ids,
-                                attention_mask=source_mask,
-                                use_cache=True,
-                                num_beams=args.beam_size,
-                                early_stopping=True,
-                                max_length=args.max_target_length)
+                    preds = model.generate(
+                        input_ids=context_ids.cuda(),
+                        attention_mask=context_mask.cuda(),
+                        max_length=args.max_target_length
+                    )
                 top_preds = list(preds.cpu().numpy())
             pred_ids.extend(top_preds)
         
@@ -455,16 +298,15 @@ def main():
         model.train()
         predictions=[]
         with open(args.output_dir+"/test.output",'w') as f, open(args.output_dir+"/test.gold",'w') as f1:
-            for ref,gold in zip(pred_nls,eval_examples):
-                predictions.append(str(gold.idx)+'\t'+ref)
-                f.write(str(gold.idx)+'\t'+ref+'\n')
-                f1.write(str(gold.idx)+'\t'+gold.target+'\n')     
+            for ref,gold in zip(pred_nls,eval_data.data):
+                predictions.append(str(gold["idx"])+'\t'+ref)
+                f.write(str(gold["idx"])+'\t'+ref+'\n')
+                f1.write(str(gold["idx"])+'\t'+gold["target"]+'\n')     
 
         (goldMap, predictionMap) = bleu.computeMaps(predictions, os.path.join(args.output_dir, "test.gold")) 
         dev_bleu=round(bleu.bleuFromMaps(goldMap, predictionMap)[0],2)
         logger.info("  %s = %s "%("bleu-4",str(dev_bleu)))
         logger.info("  "+"*"*20)    
-
                 
 if __name__ == "__main__":
     main()
