@@ -7,6 +7,7 @@
 | 增加检索模块 | ✔ | 22.45 |
 | 增加FiD模块 | ✔ | 22.04 |
 | 测试联合训练 | ❌ |  |
+| 多GPU训练 | ❌ | - |
 
 ## 训练
 ```
@@ -20,8 +21,8 @@ python run.py \
 	--max_source_length 512 \
 	--max_target_length 64 \
 	--beam_size 10 \
-	--train_batch_size 24 \
-	--eval_batch_size 24 \
+	--train_batch_size 8 \
+	--eval_batch_size 8 \
 	--learning_rate 5e-5 \
 	--gradient_accumulation_steps 2 \
 	--num_train_epochs 10 

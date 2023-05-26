@@ -21,11 +21,9 @@ using a masked language modeling (MLM) loss.
 
 from __future__ import absolute_import
 import os
-import sys
+import copy
 import bleu
-import pickle
 import torch
-import json
 import random
 import logging
 import math
@@ -34,13 +32,15 @@ import numpy as np
 from io import open
 from itertools import cycle
 import torch.nn as nn
-from utils import get_model_size, FiDT5, Collator, Dataset
+from utils import get_model_size, Collator, Dataset, embedding_code, DoNothingCollator, EvalDataset
+from model import FiDT5, Retriever
 from tqdm import tqdm, trange
 from torch.utils.data import DataLoader, SequentialSampler, RandomSampler,TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 
 from transformers import (WEIGHTS_NAME, AdamW, get_linear_schedule_with_warmup,
-                          T5Config, T5ForConditionalGeneration, RobertaTokenizer)
+                          T5Config, T5ForConditionalGeneration, RobertaTokenizer,
+                          RobertaConfig, RobertaModel, RobertaTokenizer)
 
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
@@ -110,6 +110,7 @@ def main():
                         help="random seed for initialization")
     parser.add_argument("--warmup_steps", default=100, type=int,
                         help="Linear warmup over warmup_steps.")
+    parser.add_argument('--dropout', type=float, default=0.1, help='dropout rate')
     
     # print arguments
     args = parser.parse_args()
@@ -141,15 +142,30 @@ def main():
     
     collator = Collator(tokenizer, text_maxlength=args.max_source_length, answer_maxlength=args.max_target_length)
     
+    # build retriever
+    Rtokenizer = RobertaTokenizer.from_pretrained('microsoft/unixcoder-base')
+    Rconfig = RobertaConfig.from_pretrained('microsoft/unixcoder-base')
+    Rmodel = RobertaModel.from_pretrained('microsoft/unixcoder-base')
+    retriever = Retriever(Rmodel)
+    retriever = retriever.to(args.device)
+    
+    
     if args.n_gpu > 1:
         # multi-gpu training
-        model = torch.nn.DataParallel(model)
+        model = nn.DataParallel(model)
+        retriever = nn.DataParallel(retriever)
+    Umodel = model.module if hasattr(model, 'module') else model
+    Uretriever = retriever.module if hasattr(retriever, 'module') else retriever
 
     if args.do_train:
+        n_passage = 4
+        code_vec = None
+        
         # Prepare training data loader
-        train_data = Dataset(args.train_filename)
+        train_data = Dataset(args.train_filename, Rtokenizer)
         train_sampler = RandomSampler(train_data)
-        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size // args.gradient_accumulation_steps, collate_fn=collator)
+        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size // args.gradient_accumulation_steps, collate_fn=DoNothingCollator())
+        
 
         # Prepare optimizer and schedule (linear warmup and decay)
         no_decay = ['bias', 'LayerNorm.weight']
@@ -163,6 +179,9 @@ def main():
         scheduler = get_linear_schedule_with_warmup(optimizer,
                                                     num_warmup_steps=args.warmup_steps,
                                                     num_training_steps=num_train_optimization_steps)
+        
+        Roptimizer = AdamW(retriever.parameters(), lr=args.learning_rate, eps=1e-8)
+        Rscheduler = get_linear_schedule_with_warmup(Roptimizer, num_warmup_steps = 0, num_training_steps = len(train_dataloader) * args.num_train_epochs)
     
         #Start training
         train_example_num = len(train_data)
@@ -172,17 +191,52 @@ def main():
         logger.info("  Batch num = %d", math.ceil(train_example_num / args.train_batch_size))
         logger.info("  Num epoch = %d", args.num_train_epochs)
         
-
+        Umodel.overwrite_forward_crossattention()
+        Umodel.reset_score_storage() 
         model.train()
         patience, best_bleu, losses, dev_dataset = 0, 0, [], {}
         for epoch in range(args.num_train_epochs):
+            if code_vec is not None:
+                del(code_vec)
+            logger.info("***** Embedding code *****")
+            code_vec = embedding_code(train_data.data, retriever, args)
             for idx,batch in enumerate(train_dataloader):
-                (idx, labels, _, context_ids, context_mask) = batch
+                
+                #retrieve similar code
+                query_ids = [x['source_ids'] for x in batch]
+                query_ids = torch.tensor(query_ids).to(args.device)
+                query_vec = retriever(code_inputs = query_ids)
+                with torch.no_grad():
+                    query_vec_np = torch.zeros_like(query_vec)
+                    query_vec_np += query_vec
+                    query_vec_np = query_vec_np.cpu().numpy()
+                scores = np.matmul(query_vec_np, code_vec.T)
+                sort_ids = np.argsort(scores, axis=-1, kind='quicksort', order=None)[:,::-1]
+                for i in range(len(batch)):
+                    similar_code = []
+                    similar_comment = []
+                    similar = []
+                    for j in range(n_passage):
+                        similar_code.append(train_data.data[sort_ids[i][j+1]]['source'])
+                        similar_comment.append(train_data.data[sort_ids[i][j+1]]['target'])
+                        similar.append(int(train_data.data[sort_ids[i][j+1]]['idx']))
+                    batch[i]['similar_code']=similar_code
+                    batch[i]['similar_comment']=similar_comment
+                    batch[i]['similar']=similar
+                del(scores)
+                del(sort_ids)
+                
+                (idx, labels, _, context_ids, context_mask) = collator(batch)
+                
+                
+                # train reader
+                Umodel.reset_score_storage()
                 loss = model(
                     input_ids=context_ids.cuda(),
                     attention_mask=context_mask.cuda(),
                     labels=labels.cuda()
                 )[0]
+                crossattention_scores = Umodel.get_crossattention_scores(context_mask.cuda()).detach()
 
                 if args.n_gpu > 1:
                     loss = loss.mean() # mean() to average on multi-gpu.
@@ -200,12 +254,45 @@ def main():
                         logger.info("epoch {} step {} loss {}".format(epoch,
                                                      len(losses)//args.gradient_accumulation_steps,
                                                      round(np.mean(losses[-100*args.gradient_accumulation_steps:]),4)))
+                
+                # train retriever
+                similar_ids = [y for x in batch for y in x['similar'] ]
+                key_ids = [[train_data.data[y]['source_ids'] for y in x['similar']] for x in batch]
+                key_ids = torch.tensor(key_ids).to(args.device)
+                key_ids = key_ids.view(len(batch) * n_passage, -1)
+                key_vec = retriever(code_inputs = key_ids)
+                key_vec = key_vec.view(len(batch), n_passage, -1)
+                score = torch.einsum(
+                            'bd,bid->bi',
+                            query_vec,
+                            key_vec
+                        )
+                score = score / np.sqrt(query_vec.size(-1))
+            
+                Rloss = Uretriever.kldivloss(score, crossattention_scores)
+                if args.n_gpu > 1:
+                    Rloss = Rloss.mean()
+                    
+                if args.gradient_accumulation_steps > 1:
+                    Rloss = Rloss / args.gradient_accumulation_steps
+                
+                Rloss.backward()
+                if len(losses) % args.gradient_accumulation_steps == 0:
+                    Roptimizer.step()
+                    Roptimizer.zero_grad()
+                    Rscheduler.step()
+                    with torch.no_grad():
+                        key_vec = retriever(code_inputs=key_ids)
+                        key_vec = key_vec.cpu().numpy()
+                        for i, idx in enumerate(similar_ids):
+                            code_vec[idx] = key_vec[i]
+                
             if args.do_eval:
                 #Calculate bleu  
                 if 'dev_bleu' in dev_dataset:
                     eval_data=dev_dataset['dev_bleu']
                 else:
-                    eval_data = Dataset(args.dev_filename)
+                    eval_data = EvalDataset(args.dev_filename, tokenizer, retriever, code_vec, args, n_passage, train_data.data)
                     dev_dataset['dev_bleu'] = eval_data
 
                 eval_sampler = SequentialSampler(eval_data)
@@ -256,6 +343,9 @@ def main():
                     model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
                     output_model_file = os.path.join(output_dir, "pytorch_model.bin")
                     torch.save(model_to_save.state_dict(), output_model_file)
+                    retriever_to_save = retriever.modules if hasattr(retriever, 'module') else retriever
+                    output_retriever_file = os.path.join(output_dir, "pytorch_retriever.bin")
+                    torch.save(retriever_to_save.state_dict(), output_retriever_file)
                     patience =0
                 else:
                     patience +=1
