@@ -9,6 +9,35 @@
 | 测试联合训练 | ❌ |  |
 | 多GPU训练 | ❌ | - |
 
+## 数据
+来源于Microsoft CodeBert项目
+```
+wget https://github.com/microsoft/CodeXGLUE/raw/main/Code-Text/code-to-text/dataset.zip
+unzip dataset.zip
+rm dataset.zip
+cd dataset
+wget https://zenodo.org/record/7857872/files/python.zip
+wget https://zenodo.org/record/7857872/files/java.zip
+wget https://zenodo.org/record/7857872/files/ruby.zip
+wget https://zenodo.org/record/7857872/files/javascript.zip
+wget https://zenodo.org/record/7857872/files/go.zip
+wget https://zenodo.org/record/7857872/files/php.zip
+
+unzip python.zip
+unzip java.zip
+unzip ruby.zip
+unzip javascript.zip
+unzip go.zip
+unzip php.zip
+rm *.zip
+rm *.pkl
+
+python preprocess.py
+rm -r */final
+cd ..
+```
+在我的项目中，只使用了其中java的代码，并将其放在`dataset/train.jsonl`, `dataset/test.jsonl`, `dataset/valid.jsonl`三个文件中。如果想测试其他语言，下载后更改各个filename即可。
+
 ## 训练
 ```
 python run.py \
