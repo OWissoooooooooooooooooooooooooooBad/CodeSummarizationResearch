@@ -84,7 +84,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         scores = []
         n_passages = context_mask.size(1)
         for mod in self.decoder.block:
-            scores.append(mod.layer[1].EncDecAttention.score_storage)
+            scores.append(mod.layer[1].EncDecAttention.score_storage[:,:,0:1,:])
         scores = torch.cat(scores, dim=2)
         bsz, n_heads, n_layers, _ = scores.size()
         # batch_size, n_head, n_layers, n_passages, text_maxlength

@@ -289,10 +289,14 @@ def main():
                 
             if args.do_eval:
                 #Calculate bleu  
+                if code_vec is not None:
+                    del(code_vec)
+                logger.info("***** Embedding code *****")
+                code_vec = embedding_code(train_data.data, retriever, args)
                 if 'dev_bleu' in dev_dataset:
                     eval_data=dev_dataset['dev_bleu']
                 else:
-                    eval_data = EvalDataset(args.dev_filename, tokenizer, retriever, code_vec, args, n_passage, train_data.data)
+                    eval_data = EvalDataset(args.dev_filename, Rtokenizer, retriever, code_vec, args, n_passage, train_data.data)
                     dev_dataset['dev_bleu'] = eval_data
 
                 eval_sampler = SequentialSampler(eval_data)
