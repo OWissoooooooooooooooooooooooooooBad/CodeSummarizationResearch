@@ -195,6 +195,7 @@ def main():
         Umodel.reset_score_storage() 
         model.train()
         patience, best_bleu, losses, dev_dataset = 0, 0, [], {}
+        update_tokens, update_idx = [], []
         for epoch in range(args.num_train_epochs):
             if code_vec is not None:
                 del(code_vec)
@@ -257,9 +258,11 @@ def main():
                 
                 # train retriever
                 similar_ids = [y for x in batch for y in x['similar'] ]
+                update_idx.append(similar_ids)
                 key_ids = [[train_data.data[y]['source_ids'] for y in x['similar']] for x in batch]
                 key_ids = torch.tensor(key_ids).to(args.device)
                 key_ids = key_ids.view(len(batch) * n_passage, -1)
+                update_tokens.append(key_ids)
                 key_vec = retriever(code_inputs = key_ids)
                 key_vec = key_vec.view(len(batch), n_passage, -1)
                 score = torch.einsum(
@@ -282,10 +285,12 @@ def main():
                     Roptimizer.zero_grad()
                     Rscheduler.step()
                     with torch.no_grad():
-                        key_vec = retriever(code_inputs=key_ids)
-                        key_vec = key_vec.cpu().numpy()
-                        for i, idx in enumerate(similar_ids):
-                            code_vec[idx] = key_vec[i]
+                        for key_ids, similar_ids in zip(update_tokens, update_idx):
+                            key_vec = retriever(code_inputs=key_ids)
+                            key_vec = key_vec.cpu().numpy()
+                            for i, idx in enumerate(similar_ids):
+                                code_vec[idx] = key_vec[i]
+                        update_tokens, update_idx = [], []
                 
             if args.do_eval:
                 #Calculate bleu  
