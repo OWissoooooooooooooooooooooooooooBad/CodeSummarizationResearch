@@ -32,7 +32,7 @@ import numpy as np
 from io import open
 from itertools import cycle
 import torch.nn as nn
-from utils import get_model_size, Collator, Dataset, embedding_code, DoNothingCollator, EvalDataset
+from utils import get_model_size, Collator, TrainDataset, embedding_code, DoNothingCollator, EvalDataset
 from model import FiDT5, Retriever
 from tqdm import tqdm, trange
 from torch.utils.data import DataLoader, SequentialSampler, RandomSampler,TensorDataset
@@ -148,21 +148,14 @@ def main():
     Rmodel = RobertaModel.from_pretrained('microsoft/unixcoder-base')
     retriever = Retriever(Rmodel)
     retriever = retriever.to(args.device)
-    
-    
-    if args.n_gpu > 1:
-        # multi-gpu training
-        model = nn.DataParallel(model)
-        retriever = nn.DataParallel(retriever)
-    Umodel = model.module if hasattr(model, 'module') else model
-    Uretriever = retriever.module if hasattr(retriever, 'module') else retriever
+
+    n_passage = 4
+    code_vec = None
 
     if args.do_train:
-        n_passage = 4
-        code_vec = None
         
         # Prepare training data loader
-        train_data = Dataset(args.train_filename, Rtokenizer)
+        train_data = TrainDataset(args.train_filename, Rtokenizer)
         train_sampler = RandomSampler(train_data)
         train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size // args.gradient_accumulation_steps, collate_fn=DoNothingCollator())
         
@@ -191,10 +184,11 @@ def main():
         logger.info("  Batch num = %d", math.ceil(train_example_num / args.train_batch_size))
         logger.info("  Num epoch = %d", args.num_train_epochs)
         
-        Umodel.overwrite_forward_crossattention()
-        Umodel.reset_score_storage() 
+        model.overwrite_forward_crossattention()
+        model.reset_score_storage() 
         model.train()
         patience, best_bleu, losses, dev_dataset = 0, 0, [], {}
+        Rlosses = []
         update_tokens, update_idx = [], []
         for epoch in range(args.num_train_epochs):
             if code_vec is not None:
@@ -231,16 +225,15 @@ def main():
                 
                 
                 # train reader
-                Umodel.reset_score_storage()
+                model.reset_score_storage()
+                model.train()
                 loss = model(
                     input_ids=context_ids.cuda(),
                     attention_mask=context_mask.cuda(),
                     labels=labels.cuda()
                 )[0]
-                crossattention_scores = Umodel.get_crossattention_scores(context_mask.cuda()).detach()
+                crossattention_scores = model.get_crossattention_scores(context_mask.cuda()).detach()
 
-                if args.n_gpu > 1:
-                    loss = loss.mean() # mean() to average on multi-gpu.
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
                     
@@ -252,11 +245,12 @@ def main():
                     optimizer.zero_grad()
                     scheduler.step()
                     if len(losses) // args.gradient_accumulation_steps % 100 == 0:
-                        logger.info("epoch {} step {} loss {}".format(epoch,
+                        logger.info("reader - epoch {} step {} loss {}".format(epoch,
                                                      len(losses)//args.gradient_accumulation_steps,
                                                      round(np.mean(losses[-100*args.gradient_accumulation_steps:]),4)))
                 
                 # train retriever
+                retriever.train()
                 similar_ids = [y for x in batch for y in x['similar'] ]
                 update_idx.append(similar_ids)
                 key_ids = [[train_data.data[y]['source_ids'] for y in x['similar']] for x in batch]
@@ -272,19 +266,23 @@ def main():
                         )
                 score = score / np.sqrt(query_vec.size(-1))
             
-                Rloss = Uretriever.kldivloss(score, crossattention_scores)
-                if args.n_gpu > 1:
-                    Rloss = Rloss.mean()
+                Rloss = retriever.kldivloss(score, crossattention_scores)
                     
                 if args.gradient_accumulation_steps > 1:
                     Rloss = Rloss / args.gradient_accumulation_steps
                 
+                Rlosses.append(Rloss.item())
                 Rloss.backward()
-                if len(losses) % args.gradient_accumulation_steps == 0:
+                if len(Rlosses) % args.gradient_accumulation_steps == 0:
                     Roptimizer.step()
                     Roptimizer.zero_grad()
                     Rscheduler.step()
+                    if len(Rlosses) // args.gradient_accumulation_steps % 100 == 0:
+                        logger.info("retriever - epoch {} step {} loss {}".format(epoch,
+                                                     len(Rlosses)//args.gradient_accumulation_steps,
+                                                     round(np.mean(Rlosses[-100*args.gradient_accumulation_steps:]),4)))
                     with torch.no_grad():
+                        retriever.eval()
                         for key_ids, similar_ids in zip(update_tokens, update_idx):
                             key_vec = retriever(code_inputs=key_ids)
                             key_vec = key_vec.cpu().numpy()
@@ -294,6 +292,8 @@ def main():
                 
             if args.do_eval:
                 #Calculate bleu  
+                retriever.eval()
+                model.eval() 
                 if code_vec is not None:
                     del(code_vec)
                 logger.info("***** Embedding code *****")
@@ -307,23 +307,15 @@ def main():
                 eval_sampler = SequentialSampler(eval_data)
                 eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size, collate_fn=collator)
 
-                model.eval() 
                 pred_ids = []
                 for batch in eval_dataloader:
                     (idx, _, _, context_ids, context_mask) = batch
                     with torch.no_grad():
-                        if args.n_gpu > 1:
-                            preds = model.module.generate(
-                                input_ids=context_ids.cuda(),
-                                attention_mask=context_mask.cuda(),
-                                max_length=args.max_target_length
-                            )
-                        else:
-                            preds = model.generate(
-                                input_ids=context_ids.cuda(),
-                                attention_mask=context_mask.cuda(),
-                                max_length=args.max_target_length
-                            )
+                        preds = model.generate(
+                            input_ids=context_ids.cuda(),
+                            attention_mask=context_mask.cuda(),
+                            max_length=args.max_target_length
+                        )
                         top_preds = list(preds.cpu().numpy())
                     pred_ids.extend(top_preds)
                 
@@ -364,9 +356,15 @@ def main():
         checkpoint_prefix = 'checkpoint-best-bleu/pytorch_model.bin'
         output_dir = os.path.join(args.output_dir, checkpoint_prefix)  
         model_to_load = model.module if hasattr(model, 'module') else model  
-        model_to_load.load_state_dict(torch.load(output_dir))                
+        model_to_load.load_state_dict(torch.load(output_dir))
+        retriever_prefix = 'checkpoint-best-bleu/pytorch_retriever.bin'  
+        retriever_dir = os.path.join(args.output_dir, retriever_prefix)
+        retriever.load_state_dict(torch.load(retriever_dir))
 
-        eval_data = Dataset(args.test_filename)  
+        train_data = TrainDataset(args.train_filename, Rtokenizer)
+        logger.info("***** Embedding code *****")
+        code_vec = embedding_code(train_data.data, retriever, args)
+        eval_data = EvalDataset(args.test_filename, Rtokenizer, retriever, code_vec, args, n_passage, train_data.data) 
 
         # Calculate bleu
         eval_sampler = SequentialSampler(eval_data)

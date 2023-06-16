@@ -52,7 +52,7 @@ class DoNothingCollator(object):
     def __call__(self, batch):
         return batch
 
-class Dataset(torch.utils.data.Dataset):
+class TrainDataset(torch.utils.data.Dataset):
     def __init__(self, filename, tokenizer):
         self.data = read_examples(filename, tokenizer)
     
@@ -149,6 +149,7 @@ class TextDataset(Dataset):
         return torch.tensor(self.examples[i]["source_ids"])
 
 def embedding_code(examples, retriever, args):
+    retriever.eval()
     code_vecs = []
     dataset = TextDataset(examples)
     sampler = SequentialSampler(dataset)
@@ -158,6 +159,7 @@ def embedding_code(examples, retriever, args):
             code_vec=retriever(code_inputs=batch.to(args.device))
             code_vecs.append(code_vec.cpu().numpy())
     code_vecs = np.concatenate(code_vecs,0)
+    retriever.train()
     return code_vecs
 
 class EvalDataset(torch.utils.data.Dataset):

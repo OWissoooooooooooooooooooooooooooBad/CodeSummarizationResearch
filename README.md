@@ -6,8 +6,11 @@
 | 将CodeT5中关于CodeSummarization的部分提取出来，并保证运行结果与直接使用原版本一致 | ✔ | 20.5 |
 | 增加检索模块 | ✔ | 22.45 |
 | 增加FiD模块 | ✔ | 22.04(4 passages) |
-| 测试联合训练 | ❓ | 19.62(debugging) |
+| 测试联合训练 | ❓ | 19.99(debugging) |
 | 多GPU训练 | ❌ | - |
+
+
+目前看来联合训练效果较差的原因是retriever学习的目标不对，也许应该第一个epoch不训练retriever，让reader学会FiD之后再给retriever训练目标。
 
 ## 数据
 来源于Microsoft CodeBert项目
